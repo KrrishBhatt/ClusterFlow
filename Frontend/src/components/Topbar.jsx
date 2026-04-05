@@ -1,7 +1,7 @@
 import React from 'react'
 import { Link, useLocation, useNavigate } from 'react-router-dom'
 import { clearAuth, getUserId } from '../utils/auth'
-import logo from '../assets/logo.jpeg'
+import logo from '../assets/Logo.jpeg'
 
 const NAV = [
   { path: '/dashboard', label: 'Dashboard' },

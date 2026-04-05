@@ -4,7 +4,7 @@ import { authService } from '../services'
 import { setAuth } from '../utils/auth'
 import Toast from '../components/Toast'
 import { useToast } from '../hooks/useToast'
-import logo from '../assets/logo.jpeg'
+import logo from '../assets/Logo.jpeg'
 
 export default function LoginPage() {
   const navigate = useNavigate()

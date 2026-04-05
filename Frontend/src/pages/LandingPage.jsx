@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import logo from '../assets/logo.jpeg'
+import logo from '../assets/Logo.jpeg'
 
 const FEATURES = [
   { title: 'Distributed Processing', desc: 'Split massive datasets across your team in real time. Every node contributes, every chunk matters.' },
