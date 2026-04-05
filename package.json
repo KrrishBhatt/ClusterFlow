@@ -6,6 +6,6 @@
     "express": "^5.2.1",
     "json2csv": "5.0.7",
     "jsonwebtoken": "^9.0.3",
-    "multer": "^2.1.1"
+    "multer": "^2.1.1-lts.1"
   }
 }
