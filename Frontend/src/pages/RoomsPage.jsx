@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Topbar from '../components/Topbar'
 import Toast from '../components/Toast'
@@ -9,25 +9,26 @@ import API from '../services/api'
 export default function RoomsPage() {
   const { toast, success, error, info } = useToast()
   const navigate = useNavigate()
+  const pollRef  = useRef(null)
 
+  // room creation
   const [creating, setCreating]       = useState(false)
   const [createdRoom, setCreatedRoom] = useState(null)
 
+  // pending invites (for this user)
   const [invites, setInvites]         = useState([])
   const [invLoading, setInvLoading]   = useState(true)
-  const [actionLoading, setActionLoading] = useState({})
-  const setAL = (k, v) => setActionLoading(p => ({ ...p, [k]: v }))
+  const [accepting, setAccepting]     = useState({})
+  const [rejecting, setRejecting]     = useState({})
 
-  const [reenterId, setReenterId] = useState('')
+  // re-enter room
+  const [reenterId, setReenterId]     = useState('')
 
+  // load invites + poll every 8s
   const loadInvites = useCallback(async () => {
-    setInvLoading(true)
     try {
-      // Backend has getInvites() defined but NOT registered as a route — will 404
-      // We attempt it silently; if it ever gets fixed on the backend it will work automatically
-      const res = await API.get('/rooms/invites')
-      const list = res.data?.invites
-      setInvites(Array.isArray(list) ? list : [])
+      const res  = await API.get('/rooms/invites')
+      setInvites(Array.isArray(res.data?.invites) ? res.data.invites : [])
     } catch {
       setInvites([])
     } finally {
@@ -35,8 +36,13 @@ export default function RoomsPage() {
     }
   }, [])
 
-  useEffect(() => { loadInvites() }, [loadInvites])
+  useEffect(() => {
+    loadInvites()
+    pollRef.current = setInterval(loadInvites, 8000)
+    return () => clearInterval(pollRef.current)
+  }, [loadInvites])
 
+  // create room
   async function handleCreate() {
     setCreating(true)
     setCreatedRoom(null)
@@ -52,28 +58,37 @@ export default function RoomsPage() {
     finally { setCreating(false) }
   }
 
+  // enter created room as host
+  function enterRoom(roomId) {
+    sessionStorage.setItem(`cf_host_${roomId}`, 'true')
+    navigate(`/room/${roomId}`)
+  }
+
+  // accept invite → go to room
   async function handleAccept(inviteId, roomId) {
-    setAL('a_' + inviteId, true)
+    setAccepting(p => ({ ...p, [inviteId]: true }))
     try {
       const d = await roomsService.acceptInvite(inviteId)
       if (d.message === 'Invite accepted') {
         success('Joined the room!')
+        sessionStorage.removeItem(`cf_host_${roomId}`)
         navigate(`/room/${roomId}`)
       } else {
         error(d.message)
       }
     } catch (e) { error(e.message) }
-    finally { setAL('a_' + inviteId, false) }
+    finally { setAccepting(p => ({ ...p, [inviteId]: false })) }
   }
 
+  // reject invite
   async function handleReject(inviteId) {
-    setAL('r_' + inviteId, true)
+    setRejecting(p => ({ ...p, [inviteId]: true }))
     try {
       const d = await roomsService.rejectInvite(inviteId)
       info(d.message || 'Invite rejected')
       setInvites(prev => prev.filter(i => i._id !== inviteId))
     } catch (e) { error(e.message) }
-    finally { setAL('r_' + inviteId, false) }
+    finally { setRejecting(p => ({ ...p, [inviteId]: false })) }
   }
 
   return (
@@ -84,10 +99,11 @@ export default function RoomsPage() {
 
         <div className="page-header">
           <h1 className="page-title">Rooms<span className="page-title-accent">.</span></h1>
-          <p className="page-subtitle">// create a cluster or respond to room invites</p>
+          <p className="page-subtitle">// create a room or accept an invite</p>
         </div>
 
-        <div className="grid-2">
+        {/* ── ROW 1: CREATE + INVITES ── */}
+        <div className="grid-2" style={{ marginBottom: '1.25rem' }}>
 
           {/* CREATE ROOM */}
           <div className="card">
@@ -95,99 +111,103 @@ export default function RoomsPage() {
               <div className="card-title">Create a Room</div>
             </div>
             <p className="text-muted" style={{ fontSize: '0.875rem', lineHeight: 1.65, marginBottom: '1.25rem' }}>
-              Start a new cluster room. You become the <span className="text-amber">host</span> — invite friends,
-              upload a dataset, distribute processing chunks, and monitor progress.
+              You become the <span className="text-amber">host</span>. Invite friends,
+              upload a dataset, and let the team process it automatically.
             </p>
             <button className="btn btn-green btn-full" onClick={handleCreate} disabled={creating}>
               {creating ? 'Creating...' : 'Create New Room'}
             </button>
 
             {createdRoom && (
-              <div style={{
-                marginTop: '1.25rem',
-                background: 'var(--green-ghost)',
-                border: '1px solid var(--green-border)',
-                borderRadius: 'var(--radius-md)',
-                padding: '1.1rem',
-              }}>
+              <div style={{ marginTop: '1.25rem', background: 'var(--green-ghost)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-md)', padding: '1.1rem' }}>
                 <div style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--green-mid)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.5rem' }}>
-                  Room Created — share this ID with friends
+                  Room Created — enter the room to invite friends
                 </div>
                 <div className="mono text-green" style={{ fontSize: '1.15rem', marginBottom: '0.9rem' }}>
                   {createdRoom}
                 </div>
-                <button className="btn btn-green btn-full" onClick={() => navigate(`/room/${createdRoom}`)}>
-                  Enter Room
+                <button className="btn btn-green btn-full" onClick={() => enterRoom(createdRoom)}>
+                  Enter Room as Host
                 </button>
               </div>
             )}
           </div>
 
-          {/* ROOM INVITES */}
+          {/* PENDING INVITES */}
           <div className="card">
             <div className="card-header">
-              <div className="card-title">Room Invites</div>
-              {invites.length > 0 && <span className="badge badge-amber">{invites.length} pending</span>}
+              <div className="card-title">
+                Pending Invites
+                {invites.length > 0 && (
+                  <span className="badge badge-amber" style={{ marginLeft: '0.5rem' }}>
+                    {invites.length}
+                  </span>
+                )}
+              </div>
+              <button className="btn btn-ghost btn-sm" onClick={loadInvites}
+                style={{ fontSize: '0.72rem', padding: '0.2rem 0.6rem' }}>
+                Refresh
+              </button>
             </div>
 
             {invLoading ? (
-              <div className="empty-state" style={{ padding: '2rem' }}>
-                <div className="empty-state-text">Checking invites...</div>
+              <div className="text-muted" style={{ fontSize: '0.875rem' }}>Checking...</div>
+            ) : invites.length === 0 ? (
+              <div style={{ textAlign: 'center', padding: '1.5rem 0' }}>
+                <div style={{ fontSize: '2rem', opacity: 0.2, marginBottom: '0.5rem' }}>✉</div>
+                <div className="text-muted" style={{ fontSize: '0.875rem' }}>
+                  No pending invites.<br />
+                  Refreshes every 8 seconds.
+                </div>
               </div>
-            ) : invites.length > 0 ? (
-              <>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
                 {invites.map(inv => (
-                  <div key={inv._id} className="invite-card">
+                  <div key={inv._id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.85rem 1rem', background: 'var(--bg-elevated)', border: '1px solid var(--amber-border,var(--border))', borderRadius: 'var(--radius-md)', gap: '0.5rem', flexWrap: 'wrap' }}>
                     <div>
-                      <div style={{ fontWeight: 700, fontSize: '0.9rem', marginBottom: '0.2rem' }}>
-                        {inv.sender?.username || 'Unknown'} invited you
+                      <div style={{ fontWeight: 700, fontSize: '0.9rem' }}>
+                        {inv.sender?.username || 'Someone'} invited you
                       </div>
-                      <div className="mono text-muted" style={{ fontSize: '0.78rem' }}>Room: {inv.roomId}</div>
+                      <div className="mono text-muted" style={{ fontSize: '0.75rem' }}>
+                        {inv.roomId}
+                      </div>
                     </div>
                     <div style={{ display: 'flex', gap: '0.4rem' }}>
                       <button className="btn btn-green btn-sm"
-                        disabled={actionLoading['a_' + inv._id]}
+                        disabled={accepting[inv._id]}
                         onClick={() => handleAccept(inv._id, inv.roomId)}>
-                        {actionLoading['a_' + inv._id] ? '...' : 'Accept'}
+                        {accepting[inv._id] ? '...' : 'Accept'}
                       </button>
                       <button className="btn btn-ghost btn-sm"
-                        disabled={actionLoading['r_' + inv._id]}
+                        disabled={rejecting[inv._id]}
                         onClick={() => handleReject(inv._id)}>
-                        {actionLoading['r_' + inv._id] ? '...' : 'Reject'}
+                        {rejecting[inv._id] ? '...' : 'Reject'}
                       </button>
                     </div>
                   </div>
                 ))}
-              </>
-            ) : (
-              <div style={{ padding: '2rem 0.5rem', textAlign: 'center' }}>
-                <div style={{ fontSize: '2.5rem', marginBottom: '0.75rem', opacity: 0.25 }}>&#128235;</div>
-                <div className="text-muted" style={{ fontSize: '0.875rem', lineHeight: 1.65 }}>
-                  No pending invites right now.<br />
-                  Ask a room host to invite you — they send it from inside their room.
-                </div>
               </div>
             )}
           </div>
-
         </div>
 
-        {/* RE-ENTER ROOM */}
-        <div className="card" style={{ marginTop: '1.25rem', borderColor: 'var(--border-bright)' }}>
+        {/* ── RE-ENTER ROOM ── */}
+        <div className="card">
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '1rem' }}>
             <div>
               <div style={{ fontWeight: 700, marginBottom: '0.25rem' }}>Already in a room?</div>
               <div className="text-muted" style={{ fontSize: '0.82rem' }}>
-                If you previously joined a room, enter the Room ID to go back in.
+                Enter the Room ID to go back in.
               </div>
             </div>
             <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
               <input
                 className="form-input"
-                style={{ width: 200 }}
+                style={{ width: 185 }}
                 placeholder="ROOM-XXXXXX"
                 value={reenterId}
-                onChange={e => setReenterId(e.target.value)}
+                onChange={e => setReenterId(e.target.value.toUpperCase())}
+                onKeyDown={e => { if (e.key === 'Enter' && reenterId.trim()) navigate(`/room/${reenterId.trim()}`) }}
               />
               <button
                 className="btn btn-ghost"

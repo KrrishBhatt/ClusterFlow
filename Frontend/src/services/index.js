@@ -31,6 +31,13 @@ export const roomsService = {
   inviteFriend: (roomId, receiverId)  => API.post('/rooms/invite', { roomId, receiverId }).then(r => r.data),
   acceptInvite: (inviteId)            => API.post('/rooms/invite/accept', { inviteId }).then(r => r.data),
   rejectInvite: (inviteId)            => API.post('/rooms/invite/reject', { inviteId }).then(r => r.data),
+
+  // invite by CF-ID: first find user's _id, then send invite
+  inviteByUserId: async (roomId, cfUserId) => {
+    const user = await API.get(`/users/${cfUserId}`).then(r => r.data)
+    if (!user?._id) throw new Error('User not found - make sure CF-ID is correct')
+    return API.post('/rooms/invite', { roomId, receiverId: user._id }).then(r => r.data)
+  },
 }
 
 // ===== TASKS =====
@@ -47,6 +54,9 @@ export const tasksService = {
   },
 
   // taskId from req.query
+  // createRaw takes a pre-built FormData — avoids any transformation issues
+  createRaw: (formData) => API.post('/tasks/create', formData).then(r => r.data),
+
   getChunk:    (taskId) => API.get('/tasks/get-chunk', { params: { taskId } }).then(r => r.data),
   submitChunk: (data)   => API.post('/tasks/submit-chunk', data).then(r => r.data),
   getStatus:   (taskId) => API.get(`/tasks/status/${taskId}`).then(r => r.data),

@@ -4,334 +4,334 @@ import Topbar from '../components/Topbar'
 import Toast from '../components/Toast'
 import { useToast } from '../hooks/useToast'
 import { roomsService, tasksService, friendsService } from '../services'
-import { getMongoId, getUserId } from '../utils/auth'
+import { getUserId } from '../utils/auth'
+
+const sleep = ms => new Promise(r => setTimeout(r, ms))
 
 function StatusBadge({ s }) {
-  const colorMap = { pending:'badge-gray', processing:'badge-amber', completed:'badge-green', failed:'badge-red' }
-  const dotMap   = { pending:'gray', processing:'amber', completed:'green', failed:'red' }
+  const cm = { pending: 'badge-gray', processing: 'badge-amber', completed: 'badge-green', failed: 'badge-red' }
+  const dm = { pending: 'gray', processing: 'amber', completed: 'green', failed: 'red' }
   return (
-    <span className={`badge ${colorMap[s] || 'badge-gray'}`}>
-      <span className={`status-dot ${dotMap[s] || 'gray'}`} />
-      {s}
+    <span className={`badge ${cm[s] || 'badge-gray'}`}>
+      <span className={`status-dot ${dm[s] || 'gray'}`} />{s}
     </span>
   )
 }
 
-const TASK_TYPES = [
-  { value: 'remove_nulls',      label: 'Remove Null / Empty Rows',    desc: 'Drops any row where at least one column is empty or blank' },
-  { value: 'remove_duplicates', label: 'Remove Duplicate Rows',       desc: 'Removes rows that are identical to another row in the chunk' },
-  { value: 'normalize',         label: 'Normalize Text',              desc: 'Trims whitespace and lowercases all text fields in every row' },
-  { value: 'passthrough',       label: 'No Processing (passthrough)', desc: 'Rows returned exactly as received — useful for testing' },
-]
-
-// ─── actual processing — runs in the worker's browser ────────────────────────
-function processRows(rows, taskType) {
-  if (!rows || rows.length === 0) return []
-
-  switch (taskType) {
-
-    case 'remove_nulls':
-      return rows.filter(row =>
-        Object.values(row).every(val =>
-          val !== null && val !== undefined && String(val).trim() !== ''
-        )
-      )
-
-    case 'remove_duplicates': {
-      const seen = new Set()
-      return rows.filter(row => {
-        const key = JSON.stringify(row)
-        if (seen.has(key)) return false
-        seen.add(key)
-        return true
-      })
-    }
-
-    case 'normalize':
-      return rows.map(row => {
-        const cleaned = {}
-        for (const [key, val] of Object.entries(row)) {
-          cleaned[key] = typeof val === 'string' ? val.trim().toLowerCase() : val
-        }
-        return cleaned
-      })
-
-    default:
-      return rows
-  }
+// normalize + remove nulls + deduplicate
+function cleanRows(rows) {
+  if (!rows || !rows.length) return []
+  let out = rows.map(r => {
+    const c = {}
+    for (const [k, v] of Object.entries(r))
+      c[k] = typeof v === 'string' ? v.trim().toLowerCase() : v
+    return c
+  })
+  out = out.filter(r =>
+    Object.values(r).every(v => v !== null && v !== undefined && String(v).trim() !== '')
+  )
+  const seen = new Set()
+  return out.filter(r => {
+    const k = JSON.stringify(r)
+    if (seen.has(k)) return false
+    seen.add(k)
+    return true
+  })
 }
 
-// ─── HOST VIEW ────────────────────────────────────────────────────────────────
-function HostView({ roomId, members }) {
+/* ══════════════════════════════════════
+   HOST VIEW
+══════════════════════════════════════ */
+function HostView({ roomId, members, onRefreshMembers }) {
   const { toast, success, error, info } = useToast()
 
-  const [friends, setFriends]     = useState([])
-  const [selFriend, setSelFriend] = useState('')
-  const [inviting, setInviting]   = useState(false)
+  const [friends, setFriends]         = useState([])
+  const [friendsLoading, setFL]       = useState(true)
+  const [inviting, setInviting]       = useState({})
 
-  const [file, setFile]           = useState(null)
-  const [taskType, setTaskType]   = useState('remove_nulls')
-  const [taskInfo, setTaskInfo]   = useState(null)
-  const [creating, setCreating]   = useState(false)
+  const [file, setFile]               = useState(null)
+  const [activeTask, setActiveTask]   = useState(null)
+  const [creating, setCreating]       = useState(false)
+  const [uploadErr, setUploadErr]     = useState('')
   const fileRef = useRef()
 
-  const [taskStatus, setTaskStatus] = useState(null)
-  const [polling, setPolling]       = useState(false)
+  const [taskStatus, setTaskStatus]   = useState(null)
+  const [polling, setPolling]         = useState(false)
   const pollRef = useRef(null)
 
-  const [reassigning, setReassigning] = useState(false)
   const [result, setResult]           = useState(null)
   const [fetching, setFetching]       = useState(false)
+  const [isDone, setIsDone]           = useState(false)
+  const [reassigning, setReassigning] = useState(false)
 
   useEffect(() => {
+    // load friends
     friendsService.getAll()
       .then(d => setFriends(Array.isArray(d) ? d : []))
-      .catch(() => {})
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [])
+      .catch(() => setFriends([]))
+      .finally(() => setFL(false))
 
-  async function handleInvite(e) {
-    e.preventDefault()
-    if (!selFriend) return
-    setInviting(true)
+    // check if task already exists
+    tasksService.getTaskByRoom(roomId)
+      .then(d => {
+        if (d?.taskId) {
+          setActiveTask(d)
+          if (d.status === 'processing') beginPoll(d.taskId)
+          if (d.status === 'completed')  setIsDone(true)
+        }
+      })
+      .catch(() => {})
+
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [roomId])
+
+  // invite friend
+  async function handleInvite(f) {
+    setInviting(p => ({ ...p, [f._id]: true }))
     try {
-      const d = await roomsService.inviteFriend(roomId, selFriend)
-      d.message === 'Invite sent' ? success('Invite sent!') : error(d.message)
-      setSelFriend('')
+      const d = await roomsService.inviteFriend(roomId, f._id)
+      if (d.message === 'Invite sent') {
+        success(`Invite sent to ${f.username}!`)
+        setTimeout(onRefreshMembers, 4000)
+      } else error(d.message)
     } catch (e) { error(e.message) }
-    finally { setInviting(false) }
+    finally { setInviting(p => ({ ...p, [f._id]: false })) }
   }
 
-  async function handleCreateTask(e) {
+  // upload + distribute
+  async function handleUpload(e) {
     e.preventDefault()
-    if (!file) return
+    setUploadErr('')
+    if (!file) { setUploadErr('Select a CSV file'); return }
+    if (!file.name.toLowerCase().endsWith('.csv')) { setUploadErr('Only .csv files'); return }
     setCreating(true)
     try {
-      const d = await tasksService.create(roomId, file, taskType)
-      if (d.taskId) {
-        setTaskInfo(d)
-        success(`Task created — ${d.totalRows} rows split into ${d.totalChunks} chunks`)
+      const fd = new FormData()
+      fd.append('roomId', roomId)
+      fd.append('file', file)
+      fd.append('taskType', 'passthrough')
+      const d = await tasksService.createRaw(fd)
+      if (d?.taskId) {
+        setActiveTask(d)
         setFile(null)
         if (fileRef.current) fileRef.current.value = ''
-        beginPolling(d.taskId)
+        success(`Distributed! ${d.totalRows} rows → ${d.totalChunks} chunks`)
+        beginPoll(d.taskId)
       } else {
-        error(d.message || 'Failed to create task')
+        setUploadErr(d?.message || 'Failed — are you the host?')
       }
-    } catch (e) { error(e.message) }
+    } catch (e) { setUploadErr(e.message || 'Upload failed') }
     finally { setCreating(false) }
   }
 
-  async function fetchStatus(taskId) {
+  // poll task status every 4s
+  async function pollOnce(tid) {
     try {
-      const d = await tasksService.getStatus(taskId)
-      if (d.taskId) {
-        setTaskStatus(d)
-        if (d.status === 'completed') { stopPolling(); success('All chunks done! Result is ready.') }
-        if (d.status === 'failed')    { stopPolling(); error('Task failed.') }
-      }
+      const d = await tasksService.getStatus(tid)
+      if (!d?.taskId) return
+      setTaskStatus(d)
+      if (d.status === 'completed') { stopPoll(); setIsDone(true); success('All done! Download the result below.') }
+      if (d.status === 'failed')    { stopPoll(); error('Task failed.') }
     } catch {}
   }
-
-  function beginPolling(taskId) {
+  function beginPoll(tid) {
     setPolling(true)
-    fetchStatus(taskId)
-    pollRef.current = setInterval(() => fetchStatus(taskId), 5000)
+    pollOnce(tid)
+    pollRef.current = setInterval(() => pollOnce(tid), 4000)
   }
-
-  function stopPolling() {
+  function stopPoll() {
     setPolling(false)
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
   }
 
-  async function handleReassign() {
-    setReassigning(true)
-    try {
-      const d = await tasksService.reassign()
-      info(`Reassigned ${d.reassigned} stale chunk(s)`)
-    } catch (e) { error(e.message) }
-    finally { setReassigning(false) }
-  }
-
+  // fetch result
   async function handleFetchResult() {
-    if (!taskInfo?.taskId) return
+    const tid = activeTask?.taskId; if (!tid) return
     setFetching(true)
     try {
-      const d = await tasksService.getResult(taskInfo.taskId)
-      if (d.data) setResult(d)
-      else error(d.message || 'Result not ready yet')
+      const d = await tasksService.getResult(tid)
+      if (d?.data) setResult(d)
+      else error(d?.message || 'Result not ready')
     } catch (e) { error(e.message) }
     finally { setFetching(false) }
   }
 
-  const progress   = taskStatus?.progress || 0
-  const isComplete = taskStatus?.status === 'completed'
-  const selType    = TASK_TYPES.find(t => t.value === taskType)
-  const resultType = TASK_TYPES.find(t => t.value === (result?.taskType || taskInfo?.taskType))
+  async function handleReassign() {
+    setReassigning(true)
+    try { const d = await tasksService.reassign(); info(`Reassigned ${d.reassigned} chunk(s)`) }
+    catch (e) { error(e.message) }
+    finally { setReassigning(false) }
+  }
+
+  const progress  = taskStatus?.progress ?? activeTask?.progress ?? 0
+  const memberSet = new Set(members.map(m => m.userId))
 
   return (
     <>
       <Toast toast={toast} />
 
-      <div className="grid-2" style={{ marginBottom: '1.25rem' }}>
-
-        {/* INVITE */}
-        <div className="card">
-          <div className="card-header">
-            <div className="card-title">Invite Friends</div>
+      {/* DONE BANNER */}
+      {isDone && (
+        <div style={{ background: 'rgba(0,255,135,0.1)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-md)', padding: '1rem 1.25rem', marginBottom: '1.25rem', display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.75rem' }}>
+          <div>
+            <div style={{ fontWeight: 700, color: 'var(--green-bright)', marginBottom: '0.2rem' }}>All chunks processed!</div>
+            <div className="text-muted" style={{ fontSize: '0.82rem' }}>Dataset is ready to download.</div>
           </div>
-          {friends.length === 0 ? (
-            <p className="text-muted" style={{ fontSize: '0.875rem', lineHeight: 1.65 }}>
-              No friends yet. Go to the Friends page to add connections first.
-            </p>
-          ) : (
-            <form onSubmit={handleInvite}>
-              <div className="form-group">
-                <label className="form-label">Select friend to invite</label>
-                <select className="form-input" value={selFriend}
-                  onChange={e => setSelFriend(e.target.value)} required style={{ cursor: 'pointer' }}>
-                  <option value="">Choose a friend...</option>
-                  {friends.map(f => (
-                    <option key={f._id} value={f._id}>{f.username} — {f.userId}</option>
-                  ))}
-                </select>
-              </div>
-              <button type="submit" className="btn btn-amber btn-full" disabled={inviting || !selFriend}>
-                {inviting ? 'Sending...' : 'Send Room Invite'}
-              </button>
-            </form>
-          )}
+          <button className="btn btn-green" onClick={handleFetchResult} disabled={fetching}>
+            {fetching ? 'Fetching...' : 'Download Result'}
+          </button>
         </div>
+      )}
 
-        {/* MEMBERS */}
-        <div className="card">
-          <div className="card-header">
-            <div className="card-title">Members</div>
-            <span className="badge badge-green">{members.length} connected</span>
-          </div>
-          {members.length === 0
-            ? <p className="text-muted" style={{ fontSize: '0.875rem' }}>No members yet — invite friends above.</p>
-            : members.map((m, i) => (
-              <div key={m._id || i} className="member-row">
-                <div className="avatar avatar-sm">{(m.username || '?')[0].toUpperCase()}</div>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600, fontSize: '0.875rem' }}>{m.username}</div>
-                  <div className="mono text-muted" style={{ fontSize: '0.72rem' }}>{m.userId}</div>
+      {/* FRIENDS — invite grid */}
+      <div className="card" style={{ marginBottom: '1.25rem' }}>
+        <div className="card-header">
+          <div className="card-title">Invite Friends</div>
+          <span className="badge badge-amber">Host only</span>
+        </div>
+        {friendsLoading ? (
+          <p className="text-muted" style={{ fontSize: '0.875rem' }}>Loading friends...</p>
+        ) : friends.length === 0 ? (
+          <p className="text-muted" style={{ fontSize: '0.875rem', lineHeight: 1.65 }}>
+            No friends yet. Go to the <strong>Friends</strong> page and add some connections first.
+          </p>
+        ) : (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(210px, 1fr))', gap: '0.55rem' }}>
+            {friends.map(f => {
+              const inRoom = memberSet.has(f.userId)
+              return (
+                <div key={f._id || f.userId} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0.65rem 0.85rem', background: 'var(--bg-elevated)', border: `1px solid ${inRoom ? 'var(--green-border)' : 'var(--border)'}`, borderRadius: 'var(--radius-md)', gap: '0.5rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', minWidth: 0 }}>
+                    <div className="avatar avatar-sm">{(f.username || '?')[0].toUpperCase()}</div>
+                    <div style={{ minWidth: 0 }}>
+                      <div style={{ fontWeight: 600, fontSize: '0.82rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{f.username}</div>
+                      <div className="mono text-muted" style={{ fontSize: '0.68rem' }}>{f.userId}</div>
+                    </div>
+                  </div>
+                  {inRoom
+                    ? <span className="badge badge-green" style={{ fontSize: '0.65rem', flexShrink: 0 }}>In Room</span>
+                    : <button className="btn btn-amber btn-sm" style={{ flexShrink: 0 }} disabled={inviting[f._id]} onClick={() => handleInvite(f)}>
+                        {inviting[f._id] ? '...' : 'Invite'}
+                      </button>
+                  }
                 </div>
-                {i === 0 && <span className="badge badge-amber">Host</span>}
-              </div>
-            ))}
-        </div>
+              )
+            })}
+          </div>
+        )}
+      </div>
 
+      {/* MEMBERS */}
+      <div className="card" style={{ marginBottom: '1.25rem' }}>
+        <div className="card-header">
+          <div className="card-title">Room Members</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+            <span className="badge badge-green">{members.length}</span>
+            <button className="btn btn-ghost btn-sm" onClick={onRefreshMembers} style={{ fontSize: '0.72rem', padding: '0.2rem 0.6rem' }}>Refresh</button>
+          </div>
+        </div>
+        {members.length === 0
+          ? <p className="text-muted" style={{ fontSize: '0.875rem' }}>No members yet — invite friends above.</p>
+          : <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.5rem' }}>
+              {members.map((m, i) => (
+                <div key={m._id || i} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.4rem 0.8rem', background: 'var(--bg-elevated)', border: '1px solid var(--border)', borderRadius: '100px' }}>
+                  <div className="avatar avatar-sm" style={{ width: 22, height: 22, fontSize: '0.62rem' }}>{(m.username || '?')[0].toUpperCase()}</div>
+                  <span style={{ fontWeight: 600, fontSize: '0.85rem' }}>{m.username}</span>
+                  <span className={`badge ${i === 0 ? 'badge-amber' : 'badge-green'}`} style={{ fontSize: '0.65rem' }}>{i === 0 ? 'Host' : 'Member'}</span>
+                </div>
+              ))}
+            </div>
+        }
       </div>
 
       {/* UPLOAD */}
       <div className="card" style={{ marginBottom: '1.25rem' }}>
         <div className="card-header">
           <div className="card-title">Upload and Distribute Dataset</div>
-          <span className="badge badge-gray">{members.length} chunk{members.length !== 1 ? 's' : ''} will be created</span>
+          <span className="badge badge-gray">{members.length} chunk{members.length !== 1 ? 's' : ''}</span>
         </div>
 
-        {taskInfo ? (
-          <div style={{ padding: '1rem', background: 'var(--green-ghost)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-md)' }}>
-            <div className="mono text-green" style={{ marginBottom: '0.25rem', fontSize: '1rem' }}>{taskInfo.taskId}</div>
-            <div className="text-muted" style={{ fontSize: '0.82rem' }}>
-              {taskInfo.totalRows} rows &nbsp;·&nbsp; {taskInfo.totalChunks} chunks &nbsp;·&nbsp;
-              <span className="text-amber">{TASK_TYPES.find(t => t.value === taskInfo.taskType)?.label || taskInfo.taskType}</span>
+        {activeTask ? (
+          <div style={{ padding: '0.9rem 1rem', background: 'var(--green-ghost)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-md)' }}>
+            <div style={{ fontSize: '0.7rem', fontWeight: 700, color: 'var(--green-mid)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.35rem' }}>Active Task</div>
+            <div className="mono text-green" style={{ fontSize: '0.95rem', marginBottom: '0.2rem' }}>{activeTask.taskId}</div>
+            <div className="text-muted" style={{ fontSize: '0.8rem' }}>
+              {activeTask.totalRows || '?'} rows · {activeTask.totalChunks || members.length} chunks · cleaning applied automatically
             </div>
           </div>
         ) : (
-          <form onSubmit={handleCreateTask}>
+          <form onSubmit={handleUpload}>
+            <p className="text-muted" style={{ fontSize: '0.85rem', lineHeight: 1.65, marginBottom: '1rem' }}>
+              Upload a CSV. It will be split into <strong style={{ color: 'var(--green-bright)' }}>{members.length} chunks</strong>.
+              Each member's browser will automatically clean their chunk and submit it back.
+              You can then download the merged result.
+            </p>
             <div className="form-group">
-              <label className="form-label">Processing Operation</label>
-              <select className="form-input" value={taskType}
-                onChange={e => setTaskType(e.target.value)} style={{ cursor: 'pointer' }}>
-                {TASK_TYPES.map(t => (
-                  <option key={t.value} value={t.value}>{t.label}</option>
-                ))}
-              </select>
-              {selType && (
-                <div className="text-muted" style={{ fontSize: '0.78rem', marginTop: '0.4rem', fontFamily: 'var(--font-mono)' }}>
-                  {selType.desc}
-                </div>
-              )}
+              <label className="form-label">CSV File</label>
+              <input
+                className="form-input"
+                type="file"
+                accept=".csv"
+                ref={fileRef}
+                onChange={e => { setFile(e.target.files[0] || null); setUploadErr('') }}
+              />
             </div>
-            <div className="form-group">
-              <label className="form-label">Dataset — CSV only</label>
-              <input className="form-input" type="file" accept=".csv"
-                ref={fileRef} onChange={e => setFile(e.target.files[0])} required />
-            </div>
+            {uploadErr && (
+              <div style={{ color: '#ff4444', fontSize: '0.82rem', marginBottom: '0.75rem', padding: '0.5rem 0.85rem', background: 'rgba(255,68,68,0.08)', borderRadius: 'var(--radius-md)', border: '1px solid rgba(255,68,68,0.25)' }}>
+                {uploadErr}
+              </div>
+            )}
             <button type="submit" className="btn btn-green btn-full" disabled={creating || !file}>
-              {creating ? 'Uploading and splitting...' : 'Upload and Distribute'}
+              {creating ? 'Uploading...' : 'Upload and Distribute to All Members'}
             </button>
           </form>
         )}
       </div>
 
       {/* PROGRESS */}
-      {taskStatus && (
+      {(taskStatus || activeTask) && (
         <div className="card" style={{ marginBottom: '1.25rem' }}>
           <div className="card-header">
-            <div className="card-title">Processing Progress</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
-              {polling && (
-                <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.72rem', color: 'var(--green-bright)', display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
-                  <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--green-bright)', display: 'inline-block', boxShadow: '0 0 6px var(--green-bright)', animation: 'pulse-amber 1.2s infinite' }} />
-                  live
-                </span>
-              )}
-              <StatusBadge s={taskStatus.status} />
+            <div className="card-title">Progress</div>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+              {polling && <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'var(--green-bright)', display: 'inline-block', animation: 'pulse-amber 1.2s infinite', boxShadow: '0 0 5px var(--green-bright)' }} />}
+              <StatusBadge s={taskStatus?.status || activeTask?.status || 'processing'} />
             </div>
           </div>
-
-          <div style={{ marginBottom: '1.25rem' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem', fontSize: '0.82rem' }}>
-              <span className="text-muted">Overall progress</span>
+          <div style={{ marginBottom: '0.75rem' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.4rem', fontSize: '0.82rem' }}>
+              <span className="text-muted">Overall</span>
               <span className="mono text-green">{progress}%</span>
             </div>
-            <div className="progress-wrap">
-              <div className="progress-fill" style={{ width: `${progress}%` }} />
-            </div>
-            <div style={{ marginTop: '0.35rem', fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
-              {taskStatus.processedChunks} of {taskStatus.totalChunks} chunks processed
+            <div className="progress-wrap"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
+            <div style={{ marginTop: '0.3rem', fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+              {taskStatus?.processedChunks ?? activeTask?.processedChunks ?? 0} of {taskStatus?.totalChunks ?? activeTask?.totalChunks ?? members.length} chunks done
             </div>
           </div>
-
-          {taskStatus.chunks?.length > 0 && (
+          {taskStatus?.chunks?.length > 0 && (
             <div className="table-wrap">
               <table className="table">
-                <thead>
-                  <tr><th>Chunk</th><th>Assigned To</th><th>Status</th><th>Retries</th></tr>
-                </thead>
-                <tbody>
-                  {taskStatus.chunks.map(c => (
-                    <tr key={c._id}>
-                      <td className="mono" style={{ color: 'var(--text-secondary)' }}>{c.chunkIndex}</td>
-                      <td className="mono" style={{ fontSize: '0.78rem', color: 'var(--text-muted)', maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                        {c.assignedTo || <span style={{ opacity: 0.4 }}>unassigned</span>}
-                      </td>
-                      <td><StatusBadge s={c.status} /></td>
-                      <td className="mono" style={{ color: c.retryCount > 0 ? 'var(--amber-bright)' : 'var(--text-muted)' }}>
-                        {c.retryCount}/{c.maxRetries}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
+                <thead><tr><th>Chunk</th><th>Status</th><th>Retries</th></tr></thead>
+                <tbody>{taskStatus.chunks.map(c => (
+                  <tr key={c._id}>
+                    <td className="mono" style={{ color: 'var(--text-secondary)' }}>{c.chunkIndex}</td>
+                    <td><StatusBadge s={c.status} /></td>
+                    <td className="mono" style={{ color: c.retryCount > 0 ? 'var(--amber-bright)' : 'var(--text-muted)' }}>{c.retryCount}/{c.maxRetries}</td>
+                  </tr>
+                ))}</tbody>
               </table>
             </div>
           )}
-
-          <div style={{ display: 'flex', gap: '0.75rem', marginTop: '1rem', flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.85rem', flexWrap: 'wrap' }}>
+            {!polling && (taskStatus?.status === 'processing' || activeTask?.status === 'processing') && (
+              <button className="btn btn-ghost btn-sm" onClick={() => beginPoll(activeTask?.taskId)}>Resume Tracking</button>
+            )}
             <button className="btn btn-ghost btn-sm" onClick={handleReassign} disabled={reassigning}>
               {reassigning ? 'Scanning...' : 'Reassign Stale Chunks'}
             </button>
-            {!polling && taskStatus.status === 'processing' && (
-              <button className="btn btn-ghost btn-sm" onClick={() => beginPolling(taskInfo?.taskId)}>
-                Resume Live Tracking
-              </button>
-            )}
-            {isComplete && (
+            {isDone && (
               <button className="btn btn-green btn-sm" onClick={handleFetchResult} disabled={fetching}>
-                {fetching ? 'Fetching...' : 'Fetch and Download Result'}
+                {fetching ? 'Fetching...' : 'Download Result'}
               </button>
             )}
           </div>
@@ -345,31 +345,22 @@ function HostView({ roomId, members }) {
             <div className="card-title">Result Ready</div>
             <span className="badge badge-green">{result.totalRows} rows</span>
           </div>
-          <div style={{ display: 'flex', gap: '1rem', alignItems: 'center', marginBottom: '1rem', flexWrap: 'wrap' }}>
-            <a href={tasksService.downloadUrl(taskInfo.taskId)} className="btn btn-green" download target="_blank" rel="noreferrer">
-              Download Processed CSV
-            </a>
-            <span className="text-muted mono" style={{ fontSize: '0.78rem' }}>
-              {result.totalRows} rows &nbsp;·&nbsp; {resultType?.label}
-            </span>
-          </div>
+          <a href={tasksService.downloadUrl(activeTask.taskId)} className="btn btn-green" style={{ marginBottom: result.data?.length ? '1rem' : 0 }} download target="_blank" rel="noreferrer">
+            Download Processed CSV
+          </a>
           {result.data?.length > 0 && (() => {
             const preview = result.data.slice(0, 5)
             const cols    = Object.keys(preview[0])
             return (
               <div className="table-wrap">
-                <p className="text-muted" style={{ fontSize: '0.75rem', marginBottom: '0.4rem' }}>Preview — first {preview.length} rows</p>
+                <p className="text-muted" style={{ fontSize: '0.75rem', marginBottom: '0.3rem' }}>Preview — first {preview.length} rows</p>
                 <table className="table">
                   <thead><tr>{cols.map(c => <th key={c}>{c}</th>)}</tr></thead>
-                  <tbody>
-                    {preview.map((row, i) => (
-                      <tr key={i}>{cols.map(c => (
-                        <td key={c} className="mono" style={{ fontSize: '0.78rem', color: 'var(--text-secondary)' }}>
-                          {String(row[c] ?? '')}
-                        </td>
-                      ))}</tr>
-                    ))}
-                  </tbody>
+                  <tbody>{preview.map((row, i) => (
+                    <tr key={i}>{cols.map(c => (
+                      <td key={c} className="mono" style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{String(row[c] ?? '')}</td>
+                    ))}</tr>
+                  ))}</tbody>
                 </table>
               </div>
             )
@@ -380,267 +371,251 @@ function HostView({ roomId, members }) {
   )
 }
 
-// ─── WORKER VIEW ──────────────────────────────────────────────────────────────
+/* ══════════════════════════════════════
+   WORKER VIEW — auto: find task → fetch chunk → clean → submit
+══════════════════════════════════════ */
 function WorkerView({ roomId }) {
-  const { toast, success, error, info } = useToast()
+  const { success, error } = useToast()
+  const [log, setLog]           = useState([])
+  const [status, setStatus]     = useState('waiting')
+  const [chunk, setChunk]       = useState(null)
+  const [cleaned, setCleaned]   = useState(null)
+  const [taskProgress, setTP]   = useState(null)
+  const ran  = useRef(false)
+  const poll = useRef(null)
 
-  const [taskId, setTaskId]           = useState(null)
-  const [taskLoading, setTaskLoading] = useState(true)
-  const [chunk, setChunk]             = useState(null)
-  const [fetching, setFetching]       = useState(false)
-  const [processing, setProcessing]   = useState(false)
-  const [processed, setProcessed]     = useState(null)
-  const [submitted, setSubmitted]     = useState(false)
-  const [submitting, setSubmitting]   = useState(false)
+  const addLog = msg => setLog(p => [...p, { t: new Date().toLocaleTimeString(), msg }])
 
   useEffect(() => {
-    tasksService.getTaskByRoom(roomId)
-      .then(d => { if (d.taskId) setTaskId(d.taskId) })
-      .catch(() => {})
-      .finally(() => setTaskLoading(false))
-  }, [roomId])
+    if (ran.current) return
+    ran.current = true
+    go()
+    return () => { if (poll.current) clearInterval(poll.current) }
+  }, [])
 
-  async function handleGetChunk() {
-    if (!taskId) return error('No active task yet. Wait for the host to upload a dataset.')
-    setFetching(true)
-    setProcessed(null)
-    try {
-      const d = await tasksService.getChunk(taskId)
-      if (d.chunkIndex !== undefined) {
-        setChunk(d)
-        info(`Chunk ${d.chunkIndex} assigned — ${d.rows?.length || 0} rows received`)
-      } else {
-        error(d.message || 'No chunk available right now')
-      }
-    } catch (e) { error(e.message) }
-    finally { setFetching(false) }
-  }
-
-  function handleProcess() {
-    if (!chunk?.rows) return
-    setProcessing(true)
-    try {
-      const result  = processRows(chunk.rows, chunk.taskType || 'passthrough')
-      const removed = chunk.rows.length - result.length
-      setProcessed(result)
-      success(`Done — ${result.length} rows kept, ${removed} removed`)
-    } catch (e) {
-      error('Processing failed: ' + e.message)
-    } finally {
-      setProcessing(false)
+  async function go() {
+    // 1. wait for task (poll every 6s, up to 10 minutes)
+    addLog('Waiting for host to upload a dataset...')
+    let taskId = null
+    for (let i = 0; i < 100; i++) {
+      try {
+        const d = await tasksService.getTaskByRoom(roomId)
+        if (d?.taskId) { taskId = d.taskId; setTP(d); break }
+      } catch {}
+      await sleep(6000)
     }
-  }
+    if (!taskId) { addLog('Timed out. Reload the page.'); setStatus('failed'); return }
+    addLog(`Task found: ${taskId}`)
 
-  async function handleSubmit() {
-    if (!processed) return
-    setSubmitting(true)
+    // 2. fetch chunk — retry up to 10 times
+    setStatus('fetching')
+    addLog('Fetching your assigned chunk...')
+    let chunkData = null
+    for (let i = 0; i < 10; i++) {
+      try {
+        const d = await tasksService.getChunk(taskId)
+        if (d?.chunkIndex !== undefined) { chunkData = d; break }
+      } catch {}
+      addLog(`Waiting for chunk assignment (${i + 1}/10)...`)
+      await sleep(3000)
+    }
+    if (!chunkData) { addLog('No chunk assigned. All chunks may be taken.'); setStatus('failed'); return }
+    setChunk(chunkData)
+    addLog(`Chunk ${chunkData.chunkIndex} received — rows ${chunkData.startRow}–${chunkData.endRow} (${chunkData.rows?.length || 0} rows)`)
+
+    // 3. clean rows
+    setStatus('processing')
+    addLog('Cleaning: normalize → remove nulls → deduplicate...')
+    await sleep(80)
+    let result
+    try {
+      result = cleanRows(chunkData.rows || [])
+      setCleaned(result)
+      addLog(`Cleaned — ${result.length} rows kept, ${(chunkData.rows?.length || 0) - result.length} removed`)
+    } catch (e) { addLog('Error: ' + e.message); setStatus('failed'); return }
+
+    // 4. submit
+    setStatus('submitting')
+    addLog('Submitting processed data to server...')
     try {
       const d = await tasksService.submitChunk({
         taskId,
-        chunkIndex:    chunk.chunkIndex,
-        processedData: processed,
-        status:        'completed'
+        chunkIndex:    chunkData.chunkIndex,
+        processedData: result,
+        status:        'completed',
       })
-      success(`Submitted — overall progress: ${d.progress}%`)
-      setSubmitted(true)
-    } catch (e) { error(e.message) }
-    finally { setSubmitting(false) }
+      addLog(`Submitted! Overall progress: ${d.progress}%`)
+      setStatus('done')
+      success('Your chunk has been processed and submitted!')
+
+      // 5. keep polling overall progress so worker can see it
+      poll.current = setInterval(async () => {
+        try {
+          const p = await tasksService.getStatus(taskId)
+          if (p?.taskId) {
+            setTP(p)
+            if (p.status === 'completed' || p.status === 'failed') {
+              clearInterval(poll.current)
+              addLog(`Task ${p.status}!`)
+            }
+          }
+        } catch {}
+      }, 5000)
+    } catch (e) { addLog('Submit failed: ' + e.message); setStatus('failed'); error('Submit failed: ' + e.message) }
   }
 
-  async function handleFail() {
-    setSubmitting(true)
-    try {
-      await tasksService.submitChunk({ taskId, chunkIndex: chunk.chunkIndex, processedData: [], status: 'failed' })
-      info('Marked as failed — will be reassigned')
-      setChunk(null)
-      setProcessed(null)
-    } catch (e) { error(e.message) }
-    finally { setSubmitting(false) }
-  }
-
-  const selType = TASK_TYPES.find(t => t.value === chunk?.taskType)
-
-  if (taskLoading) return (
-    <div className="card" style={{ maxWidth: 640, textAlign: 'center', padding: '2.5rem' }}>
-      <div className="empty-state-text">Checking for active task...</div>
-    </div>
-  )
+  const progress = taskProgress?.progress ?? 0
+  const statusColors = { waiting: 'var(--text-muted)', fetching: 'var(--amber-bright)', processing: 'var(--amber-bright)', submitting: 'var(--amber-bright)', done: 'var(--green-bright)', failed: '#ff4444' }
+  const statusLabels = { waiting: 'Waiting for task...', fetching: 'Fetching chunk...', processing: 'Cleaning rows...', submitting: 'Submitting...', done: 'Chunk submitted!', failed: 'Failed' }
 
   return (
     <>
-      <Toast toast={toast} />
-      <div className="card" style={{ marginBottom: '1.25rem', maxWidth: 680 }}>
+      {/* overall progress */}
+      {taskProgress && (
+        <div className="card" style={{ marginBottom: '1.25rem' }}>
+          <div className="card-header">
+            <div className="card-title">Task Progress</div>
+            <StatusBadge s={taskProgress.status || 'processing'} />
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.4rem', fontSize: '0.82rem' }}>
+            <span className="text-muted">Overall</span>
+            <span className="mono text-green">{progress}%</span>
+          </div>
+          <div className="progress-wrap"><div className="progress-fill" style={{ width: `${progress}%` }} /></div>
+          <div style={{ marginTop: '0.3rem', fontFamily: 'var(--font-mono)', fontSize: '0.75rem', color: 'var(--text-muted)' }}>
+            {taskProgress.processedChunks ?? 0} of {taskProgress.totalChunks ?? '?'} chunks done
+          </div>
+        </div>
+      )}
+
+      {/* worker status panel */}
+      <div className="card" style={{ marginBottom: '1.25rem' }}>
         <div className="card-header">
-          <div className="card-title">Your Assigned Chunk</div>
-          {taskId
-            ? <span className="badge badge-green mono" style={{ fontSize: '0.7rem' }}>{taskId}</span>
-            : <span className="badge badge-gray">No active task</span>}
+          <div className="card-title">Auto Processing</div>
+          <span style={{ fontFamily: 'var(--font-mono)', fontSize: '0.8rem', color: statusColors[status], display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+            {status !== 'done' && status !== 'failed' && (
+              <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--amber-bright)', display: 'inline-block', animation: 'pulse-amber 1s infinite' }} />
+            )}
+            {statusLabels[status]}
+          </span>
         </div>
 
-        {submitted ? (
-          <div style={{ textAlign: 'center', padding: '2.5rem 1rem' }}>
-            <div style={{ fontSize: '3rem', color: 'var(--green-bright)', marginBottom: '0.75rem' }}>&#10003;</div>
-            <div style={{ fontWeight: 700, color: 'var(--green-bright)', fontSize: '1.15rem', marginBottom: '0.5rem' }}>
-              Chunk submitted successfully
+        {chunk && (
+          <div style={{ background: 'var(--bg-deep)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-md)', padding: '0.85rem 1rem', marginBottom: '0.85rem', textAlign: 'center' }}>
+            <div className="text-muted" style={{ fontSize: '0.7rem', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.3rem' }}>Your rows</div>
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: '1.5rem', color: 'var(--green-bright)', fontWeight: 300 }}>
+              {chunk.startRow} – {chunk.endRow}
             </div>
-            <div className="text-muted" style={{ fontSize: '0.875rem', lineHeight: 1.6 }}>
-              Your processed data has been sent back to the host.
-              Waiting for other workers to complete...
+            <div className="text-muted mono" style={{ fontSize: '0.75rem', marginTop: '0.2rem' }}>
+              {chunk.rows?.length || 0} input rows
+              {cleaned && ` → ${cleaned.length} cleaned`}
             </div>
           </div>
+        )}
 
-        ) : chunk ? (
-          <>
-            {/* Chunk info */}
-            <div style={{ background: 'var(--bg-deep)', border: '1px solid var(--green-border)', borderRadius: 'var(--radius-lg)', padding: '1.5rem', textAlign: 'center', marginBottom: '1.25rem' }}>
-              <div className="text-muted" style={{ fontSize: '0.72rem', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.4rem' }}>Your assigned rows</div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: '2rem', color: 'var(--green-bright)', fontWeight: 300 }}>
-                {chunk.startRow} – {chunk.endRow}
+        <div style={{ background: 'var(--bg-deep)', border: '1px solid var(--border)', borderRadius: 'var(--radius-md)', padding: '0.75rem', fontFamily: 'var(--font-mono)', fontSize: '0.78rem', maxHeight: 160, overflowY: 'auto' }}>
+          {log.length === 0
+            ? <span style={{ color: 'var(--text-muted)' }}>Starting...</span>
+            : log.map((l, i) => (
+              <div key={i} style={{ marginBottom: '0.2rem', color: i === log.length - 1 ? 'var(--green-bright)' : 'var(--text-secondary)' }}>
+                <span style={{ color: 'var(--text-muted)', marginRight: '0.5rem' }}>[{l.t}]</span>{l.msg}
               </div>
-              <div className="text-muted mono" style={{ fontSize: '0.8rem', marginTop: '0.25rem' }}>
-                Chunk {chunk.chunkIndex} &nbsp;·&nbsp; {chunk.rows?.length || 0} rows &nbsp;·&nbsp; {chunk.datasetName}
-              </div>
+            ))
+          }
+        </div>
+
+        {status === 'done' && (
+          <div style={{ textAlign: 'center', marginTop: '1rem', padding: '0.5rem' }}>
+            <div style={{ fontSize: '2rem', color: 'var(--green-bright)', marginBottom: '0.4rem' }}>✓</div>
+            <div style={{ fontWeight: 700, color: 'var(--green-bright)' }}>Your chunk submitted!</div>
+            <div className="text-muted" style={{ fontSize: '0.82rem', marginTop: '0.25rem' }}>
+              The host will download the final result once all chunks are done.
             </div>
-
-            {/* Operation */}
-            <div style={{ background: 'rgba(255,184,48,0.07)', border: '1px solid var(--amber-border)', borderRadius: 'var(--radius-md)', padding: '0.85rem 1rem', marginBottom: '1.25rem' }}>
-              <div style={{ fontSize: '0.72rem', fontWeight: 700, color: 'var(--amber-bright)', textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: '0.2rem' }}>Operation</div>
-              <div style={{ fontWeight: 600, fontSize: '0.9rem' }}>{selType?.label || chunk.taskType}</div>
-              <div className="text-muted" style={{ fontSize: '0.8rem', marginTop: '0.15rem' }}>{selType?.desc}</div>
-            </div>
-
-            {!processed ? (
-              <>
-                <p className="text-muted" style={{ fontSize: '0.875rem', marginBottom: '1.25rem', lineHeight: 1.65 }}>
-                  You have <strong style={{ color: 'var(--green-bright)' }}>{chunk.rows?.length || 0} rows</strong> ready.
-                  Click Process to run <strong className="text-amber">{selType?.label}</strong> on your chunk locally in your browser.
-                </p>
-                <div style={{ display: 'flex', gap: '0.75rem' }}>
-                  <button className="btn btn-green" onClick={handleProcess} disabled={processing}>
-                    {processing ? 'Processing...' : 'Process My Chunk'}
-                  </button>
-                  <button className="btn btn-danger btn-sm" onClick={handleFail} disabled={submitting}>
-                    Mark as Failed
-                  </button>
-                </div>
-              </>
-            ) : (
-              <>
-                {/* Stats */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: '1.5rem', marginBottom: '1rem', padding: '0.85rem', background: 'var(--bg-deep)', borderRadius: 'var(--radius-md)' }}>
-                  <div style={{ textAlign: 'center' }}>
-                    <div className="mono" style={{ fontSize: '1.4rem', color: 'var(--text-secondary)', fontWeight: 300 }}>{chunk.rows?.length}</div>
-                    <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Input</div>
-                  </div>
-                  <div style={{ color: 'var(--green-dim)', fontSize: '1.2rem' }}>→</div>
-                  <div style={{ textAlign: 'center' }}>
-                    <div className="mono" style={{ fontSize: '1.4rem', color: 'var(--green-bright)', fontWeight: 300 }}>{processed.length}</div>
-                    <div style={{ fontSize: '0.68rem', color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Output</div>
-                  </div>
-                  <div style={{ color: 'var(--amber-bright)', fontSize: '0.85rem', fontWeight: 600 }}>
-                    {chunk.rows.length - processed.length} rows removed
-                  </div>
-                </div>
-
-                {/* Preview */}
-                {processed.length > 0 && (() => {
-                  const preview = processed.slice(0, 3)
-                  const cols    = Object.keys(preview[0])
-                  return (
-                    <div className="table-wrap" style={{ marginBottom: '1rem' }}>
-                      <p className="text-muted" style={{ fontSize: '0.72rem', marginBottom: '0.3rem' }}>Preview — first {preview.length} processed rows</p>
-                      <table className="table">
-                        <thead><tr>{cols.map(c => <th key={c}>{c}</th>)}</tr></thead>
-                        <tbody>
-                          {preview.map((row, i) => (
-                            <tr key={i}>{cols.map(c => (
-                              <td key={c} className="mono" style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>
-                                {String(row[c] ?? '')}
-                              </td>
-                            ))}</tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )
-                })()}
-
-                <div style={{ display: 'flex', gap: '0.75rem' }}>
-                  <button className="btn btn-green" onClick={handleSubmit} disabled={submitting}>
-                    {submitting ? 'Submitting...' : `Submit ${processed.length} Processed Rows`}
-                  </button>
-                  <button className="btn btn-ghost btn-sm" onClick={() => setProcessed(null)}>
-                    Re-process
-                  </button>
-                  <button className="btn btn-danger btn-sm" onClick={handleFail} disabled={submitting}>
-                    Mark as Failed
-                  </button>
-                </div>
-              </>
-            )}
-          </>
-
-        ) : (
-          <div style={{ textAlign: 'center', padding: '2rem 1rem' }}>
-            <div className="text-muted" style={{ fontSize: '0.9rem', marginBottom: '1.5rem', maxWidth: 420, margin: '0 auto 1.5rem', lineHeight: 1.65 }}>
-              {taskId
-                ? 'A dataset has been distributed. Click below to receive your assigned rows.'
-                : 'Waiting for the host to upload and distribute a dataset. Stand by.'}
-            </div>
-            <button className="btn btn-green" onClick={handleGetChunk} disabled={fetching || !taskId}>
-              {fetching ? 'Fetching...' : taskId ? 'Fetch My Chunk' : 'Waiting for task...'}
-            </button>
           </div>
+        )}
+
+        {status === 'failed' && (
+          <button className="btn btn-ghost btn-sm" style={{ marginTop: '0.75rem' }}
+            onClick={() => { ran.current = false; setStatus('waiting'); setLog([]); setChunk(null); setCleaned(null); go() }}>
+            Retry
+          </button>
         )}
       </div>
     </>
   )
 }
 
-// ─── MAIN ─────────────────────────────────────────────────────────────────────
+/* ══════════════════════════════════════
+   MAIN
+══════════════════════════════════════ */
 export default function RoomView() {
   const { roomId } = useParams()
   const navigate   = useNavigate()
   const { toast, error, info } = useToast()
-
-  const myMongoId = getMongoId()
+  const myUserId   = getUserId()
 
   const [roomInfo, setRoomInfo] = useState(null)
   const [members, setMembers]   = useState([])
   const [loading, setLoading]   = useState(true)
   const [leaving, setLeaving]   = useState(false)
   const [isHost, setIsHost]     = useState(false)
+  const [roleKnown, setRoleKnown] = useState(false)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (silent = false) => {
+    if (!silent) setLoading(true)
     try {
       const [info, mems] = await Promise.all([
         roomsService.getInfo(roomId),
         roomsService.getMembers(roomId),
       ])
-      if (!info.roomId) { setRoomInfo(null); setLoading(false); return }
+
+      if (!info?.roomId) {
+        setRoomInfo(null)
+        setRoleKnown(true)
+        setLoading(false)
+        return
+      }
+
       setRoomInfo(info)
-      const memberList = mems.members || []
-      setMembers(memberList)
-      const hostId = info.host?._id ? String(info.host._id) : String(info.host || '')
-      setIsHost(!!hostId && !!myMongoId && hostId === myMongoId)
+      const ml = mems.members || []
+      setMembers(ml)
+
+      // determine host — check sessionStorage first (set when room was created)
+      let host = sessionStorage.getItem(`cf_host_${roomId}`) === 'true'
+
+      if (!host) {
+        // backend: host is populated as {userId, username, _id}
+        if (info.host?.userId && info.host.userId === myUserId) host = true
+        // fallback: first member is host (backend adds host first on createRoom)
+        else if (ml.length > 0 && ml[0]?.userId === myUserId) host = true
+      }
+
+      if (host) sessionStorage.setItem(`cf_host_${roomId}`, 'true')
+
+      setIsHost(host)
+      setRoleKnown(true)
     } catch {
-      error('Could not load room')
+      if (!silent) error('Could not load room')
+      setRoleKnown(true)
     } finally {
-      setLoading(false)
+      if (!silent) setLoading(false)
     }
-  }, [roomId, myMongoId])
+  }, [roomId, myUserId])
 
   useEffect(() => { load() }, [load])
 
   async function handleLeave() {
     setLeaving(true)
     try { await roomsService.leave(roomId) } catch {}
-    finally { info('Left the room'); navigate('/rooms') }
+    finally {
+      sessionStorage.removeItem(`cf_host_${roomId}`)
+      info('Left the room')
+      navigate('/rooms')
+    }
   }
 
   if (loading) return (
-    <div className="app-shell">
-      <Topbar />
+    <div className="app-shell"><Topbar />
       <div className="page-content">
         <div className="empty-state" style={{ paddingTop: '6rem' }}>
           <div className="empty-state-text">Loading room...</div>
@@ -650,8 +625,7 @@ export default function RoomView() {
   )
 
   if (!roomInfo) return (
-    <div className="app-shell">
-      <Topbar />
+    <div className="app-shell"><Topbar />
       <div className="page-content">
         <div className="empty-state" style={{ paddingTop: '6rem' }}>
           <div style={{ fontSize: '3rem', opacity: 0.2, marginBottom: '1rem' }}>&#9632;</div>
@@ -665,16 +639,17 @@ export default function RoomView() {
   return (
     <div className="app-shell">
       <Topbar />
-
       <div className="room-header-bar">
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', flexWrap: 'wrap' }}>
           <button onClick={() => navigate('/rooms')} className="btn btn-ghost btn-sm" style={{ padding: '0.3rem 0.65rem' }}>
             &#8592; Rooms
           </button>
           <span className="room-id-badge">{roomId}</span>
-          <span className={`room-role-badge ${isHost ? 'room-role-host' : 'room-role-worker'}`}>
-            {isHost ? 'Host' : 'Worker'}
-          </span>
+          {roleKnown && (
+            <span className={`room-role-badge ${isHost ? 'room-role-host' : 'room-role-worker'}`}>
+              {isHost ? 'Host' : 'Member'}
+            </span>
+          )}
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
           <span className="status-dot green" />
@@ -694,16 +669,17 @@ export default function RoomView() {
             <span className="page-title-accent">.</span>
           </h1>
           <p className="page-subtitle">
-            {isHost
-              ? '// you are the host — invite, distribute, monitor'
-              : '// you are a worker — fetch, process, submit'}
+            {isHost ? '// host — invite, upload, monitor, download' : '// member — your chunk will be processed automatically'}
           </p>
         </div>
 
-        {isHost
-          ? <HostView roomId={roomId} members={members} />
-          : <WorkerView roomId={roomId} />
-        }
+        {!roleKnown ? (
+          <div className="empty-state-text">Loading...</div>
+        ) : isHost ? (
+          <HostView roomId={roomId} members={members} onRefreshMembers={() => load(true)} />
+        ) : (
+          <WorkerView roomId={roomId} />
+        )}
       </div>
     </div>
   )
