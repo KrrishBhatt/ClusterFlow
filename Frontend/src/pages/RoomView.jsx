@@ -98,6 +98,51 @@ function HostView({ roomId, members, onRefreshMembers }) {
     finally { setInviting(p => ({ ...p, [f._id]: false })) }
   }
 
+  // host auto-processes their own chunk after uploading
+  async function processHostChunk(taskId) {
+    // wait for backend to finish writing all chunks to DB
+    await sleep(2000)
+
+    // fetch chunk — retry up to 8 times with 2s gap
+    let chunk = null
+    for (let i = 0; i < 8; i++) {
+      try {
+        const d = await tasksService.getChunk(taskId)
+        if (d?.chunkIndex !== undefined && d?.rows !== undefined) {
+          chunk = d
+          break
+        }
+      } catch {}
+      await sleep(2000)
+    }
+
+    if (!chunk) {
+      console.warn('Host: no chunk assigned after retries')
+      return
+    }
+
+    // clean the rows
+    const cleaned = cleanRows(chunk.rows || [])
+
+    // submit — retry up to 5 times
+    for (let i = 0; i < 5; i++) {
+      try {
+        await tasksService.submitChunk({
+          taskId,
+          chunkIndex:    chunk.chunkIndex,
+          processedData: cleaned,
+          status:        'completed'
+        })
+        console.log(`Host chunk ${chunk.chunkIndex} submitted: ${cleaned.length} rows`)
+        return
+      } catch (e) {
+        console.warn(`Host chunk submit attempt ${i+1} failed:`, e.message)
+        await sleep(2000)
+      }
+    }
+    console.error('Host chunk: all submit attempts failed')
+  }
+
   // upload + distribute
   async function handleUpload(e) {
     e.preventDefault()
@@ -115,8 +160,10 @@ function HostView({ roomId, members, onRefreshMembers }) {
         setActiveTask(d)
         setFile(null)
         if (fileRef.current) fileRef.current.value = ''
-        success(`Distributed! ${d.totalRows} rows → ${d.totalChunks} chunks`)
+        success(`Distributed! ${d.totalRows} rows → ${d.totalChunks} chunks. Processing your chunk now...`)
         beginPoll(d.taskId)
+        // host also gets a chunk — auto-process it in the background
+        processHostChunk(d.taskId)
       } else {
         setUploadErr(d?.message || 'Failed — are you the host?')
       }
@@ -149,11 +196,44 @@ function HostView({ roomId, members, onRefreshMembers }) {
     const tid = activeTask?.taskId; if (!tid) return
     setFetching(true)
     try {
+      // fetch result data for preview
       const d = await tasksService.getResult(tid)
-      if (d?.data) setResult(d)
-      else error(d?.message || 'Result not ready')
+      if (d?.data) {
+        setResult(d)
+        // also trigger CSV download directly with auth token
+        await handleDownloadCSV(tid)
+      } else {
+        error(d?.message || 'Result not ready')
+      }
     } catch (e) { error(e.message) }
     finally { setFetching(false) }
+  }
+
+  // download CSV with auth token — avoids redirect to login
+  async function handleDownloadCSV(tid) {
+    try {
+      const token   = localStorage.getItem('cf_token')
+      const baseURL = import.meta.env.VITE_API_URL || 'http://localhost:3000/api'
+      const response = await fetch(`${baseURL}/tasks/result/download/${tid}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}))
+        error(err.message || 'Download failed')
+        return
+      }
+      const blob = await response.blob()
+      const url  = URL.createObjectURL(blob)
+      const a    = document.createElement('a')
+      a.href     = url
+      a.download = `result_${tid}.csv`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (e) {
+      error('Download failed: ' + e.message)
+    }
   }
 
   async function handleReassign() {
@@ -345,9 +425,10 @@ function HostView({ roomId, members, onRefreshMembers }) {
             <div className="card-title">Result Ready</div>
             <span className="badge badge-green">{result.totalRows} rows</span>
           </div>
-          <a href={tasksService.downloadUrl(activeTask.taskId)} className="btn btn-green" style={{ marginBottom: result.data?.length ? '1rem' : 0 }} download target="_blank" rel="noreferrer">
+          <button className="btn btn-green" style={{ marginBottom: result.data?.length ? '1rem' : 0 }}
+            onClick={() => handleDownloadCSV(activeTask.taskId)}>
             Download Processed CSV
-          </a>
+          </button>
           {result.data?.length > 0 && (() => {
             const preview = result.data.slice(0, 5)
             const cols    = Object.keys(preview[0])
